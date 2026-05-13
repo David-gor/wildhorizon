@@ -278,10 +278,8 @@ class _HomeScreenState extends State<HomeScreen> {
         RideEntry(
           name: completed.name,
           notes:
-              'Finished trail (auto-saved). ${_trailDifficultyLabel(_trailDifficultyBucket(completed))} · '
-              '${completed.lengthKm.toStringAsFixed(2)} km · ${completed.highwayType}'
-              '${completed.mtbScale != null ? ' · OSM ${completed.mtbScale}' : ''}'
-              '${completed.mtbScale == null && completed.mtbScaleImba != null ? ' · IMBA ${completed.mtbScaleImba}' : ''}',
+              'Finished trail (auto-saved). ${_trailDifficultyLabel(_trailDifficultyTier(completed))} · '
+              '${completed.lengthKm.toStringAsFixed(2)} km · ${completed.highwayType}',
         ),
       );
       if (!mounted) {
@@ -384,9 +382,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   Chip(
                     avatar: const Icon(Icons.terrain, size: 18),
                     label: Text(
-                      '${_trailDifficultyLabel(_trailDifficultyBucket(trail))}'
-                      '${trail.mtbScale != null ? ' (OSM ${trail.mtbScale})' : ''}'
-                      '${trail.mtbScale == null && trail.mtbScaleImba != null ? ' (IMBA ${trail.mtbScaleImba})' : ''}',
+                      _trailDifficultyLabel(_trailDifficultyTier(trail)),
                     ),
                   ),
                 ],
@@ -409,10 +405,8 @@ class _HomeScreenState extends State<HomeScreen> {
                     RideEntry(
                       name: trail.name,
                       notes:
-                          '${_trailDifficultyLabel(_trailDifficultyBucket(trail))} · '
-                          '${trail.lengthKm.toStringAsFixed(2)} km · ${trail.highwayType}'
-                          '${trail.mtbScale != null ? ' · OSM ${trail.mtbScale}' : ''}'
-                          '${trail.mtbScale == null && trail.mtbScaleImba != null ? ' · IMBA ${trail.mtbScaleImba}' : ''}',
+                          '${_trailDifficultyLabel(_trailDifficultyTier(trail))} · '
+                          '${trail.lengthKm.toStringAsFixed(2)} km · ${trail.highwayType}',
                     ),
                   );
                   messenger.showSnackBar(
@@ -803,21 +797,28 @@ out geom;
                       PolylineLayer(
                         polylines: _trails.map((trail) {
                           final selected = trail.osmId == _selectedTrailId;
-                          final bucket = _trailDifficultyBucket(trail);
-                          final lineColor = _trailDifficultyColor(bucket);
+                          final tier = _trailDifficultyTier(trail);
+                          final lineColor = _trailDifficultyColor(tier);
                           final baseWidth = _mapZoom >= 13
                               ? 5.0
                               : _mapZoom >= 11
                               ? 4.0
                               : 3.0;
+                          final expertDouble = !selected && tier == 3;
                           return Polyline(
                             points: trail.points,
                             color: lineColor,
-                            strokeWidth: selected ? baseWidth + 2 : baseWidth,
-                            borderStrokeWidth: selected ? 3.5 : 0,
+                            strokeWidth: selected
+                                ? baseWidth + 2
+                                : baseWidth + (expertDouble ? 0.5 : 0),
+                            borderStrokeWidth: selected
+                                ? 3.5
+                                : (expertDouble ? 2.25 : 0),
                             borderColor: selected
                                 ? Colors.yellowAccent.shade400
-                                : Colors.transparent,
+                                : (expertDouble
+                                      ? const Color(0xFFE0E0E0)
+                                      : Colors.transparent),
                           );
                         }).toList(),
                       ),
@@ -954,29 +955,16 @@ out geom;
                                       ?.copyWith(fontWeight: FontWeight.w600),
                                 ),
                                 const SizedBox(height: 4),
-                                for (var i = 0; i <= 6; i++)
+                                for (final tier in const <int>[0, 1, 2, 3])
                                   Padding(
                                     padding: const EdgeInsets.only(top: 2),
                                     child: Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.center,
                                       children: [
-                                        Container(
-                                          width: 10,
-                                          height: 10,
-                                          margin: const EdgeInsets.only(
-                                            right: 6,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: _trailDifficultyColor(i),
-                                            borderRadius: BorderRadius.circular(
-                                              2,
-                                            ),
-                                            border: Border.all(
-                                              color: Colors.black26,
-                                              width: 0.5,
-                                            ),
-                                          ),
-                                        ),
-                                        Text(_trailDifficultyLabel(i)),
+                                        _trailDifficultyLegendSwatch(tier),
+                                        const SizedBox(width: 6),
+                                        Text(_trailDifficultyLabel(tier)),
                                       ],
                                     ),
                                   ),
@@ -986,27 +974,11 @@ out geom;
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      Container(
-                                        width: 10,
-                                        height: 10,
-                                        margin: const EdgeInsets.only(
-                                          right: 6,
-                                          top: 1,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: _trailDifficultyColor(-1),
-                                          borderRadius: BorderRadius.circular(
-                                            2,
-                                          ),
-                                          border: Border.all(
-                                            color: Colors.black26,
-                                            width: 0.5,
-                                          ),
-                                        ),
-                                      ),
+                                      _trailDifficultyLegendSwatch(-1),
+                                      const SizedBox(width: 6),
                                       const Expanded(
                                         child: Text(
-                                          'Unrated — no difficulty tag in OpenStreetMap (grey lines)',
+                                          'Unrated — no difficulty tag in OpenStreetMap',
                                         ),
                                       ),
                                     ],
@@ -1360,8 +1332,8 @@ int? _parseImbaDigit(String? raw) {
   return int.tryParse(s[0]);
 }
 
-/// 0–6 = `mtb:scale` / mapped IMBA; -1 = unrated (grey), except [cycleway] → 0.
-int _trailDifficultyBucket(TrailData trail) {
+/// Raw `mtb:scale` / IMBA-derived bucket 0–6, or -1 unrated, except [cycleway] → 0.
+int _trailSacMtbBucket(TrailData trail) {
   final sac = _parseSacScaleDigit(trail.mtbScale);
   if (sac != null) {
     return sac.clamp(0, 6);
@@ -1377,37 +1349,108 @@ int _trailDifficultyBucket(TrailData trail) {
   return -1;
 }
 
-Color _trailDifficultyColor(int bucket) {
-  if (bucket < 0) {
-    return const Color(0xFF546E7A);
+/// Ski-style display tier: -1 unrated, 0 beginner, 1 intermediate, 2 advanced, 3 expert.
+int _trailDifficultyTier(TrailData trail) {
+  final b = _trailSacMtbBucket(trail);
+  if (b < 0) {
+    return -1;
   }
-  const colors = <Color>[
-    Color(0xFF1B5E20),
-    Color(0xFF388E3C),
-    Color(0xFF7CB342),
-    Color(0xFFF9A825),
-    Color(0xFFF57C00),
-    Color(0xFFD84315),
-    Color(0xFF4A148C),
-  ];
-  return colors[bucket.clamp(0, 6)];
+  if (b <= 1) {
+    return 0;
+  }
+  if (b <= 3) {
+    return 1;
+  }
+  if (b <= 5) {
+    return 2;
+  }
+  return 3;
 }
 
-/// Human-readable difficulty for map legend and trail sheet (from OSM bucket).
-String _trailDifficultyLabel(int bucket) {
-  if (bucket < 0) {
-    return 'Unrated';
+Color _trailDifficultyColor(int tier) {
+  switch (tier) {
+    case -1:
+      return const Color(0xFF90A4AE);
+    case 0:
+      return const Color(0xFF2E7D32);
+    case 1:
+      return const Color(0xFF1565C0);
+    case 2:
+    case 3:
+      return const Color(0xFF000000);
+    default:
+      return const Color(0xFF90A4AE);
   }
-  const labels = <String>[
-    'Beginner',
-    'Easy',
-    'Intermediate',
-    'Advanced',
-    'Expert',
-    'Extreme',
-    'Pro',
-  ];
-  return labels[bucket.clamp(0, 6)];
+}
+
+/// Labels for [tier] values from [_trailDifficultyTier] only.
+String _trailDifficultyLabel(int tier) {
+  switch (tier) {
+    case -1:
+      return 'Unrated';
+    case 0:
+      return 'Beginner';
+    case 1:
+      return 'Intermediate';
+    case 2:
+      return 'Advanced';
+    case 3:
+      return 'Expert';
+    default:
+      return 'Unrated';
+  }
+}
+
+Widget _trailDifficultyLegendSwatch(int tier) {
+  if (tier == 3) {
+    return SizedBox(
+      width: 14,
+      height: 10,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Transform.rotate(
+            angle: math.pi / 4,
+            child: Container(
+              width: 5,
+              height: 5,
+              decoration: BoxDecoration(
+                color: Colors.black,
+                border: Border.all(color: Colors.black26, width: 0.5),
+              ),
+            ),
+          ),
+          const SizedBox(width: 2),
+          Transform.rotate(
+            angle: math.pi / 4,
+            child: Container(
+              width: 5,
+              height: 5,
+              decoration: BoxDecoration(
+                color: Colors.black,
+                border: Border.all(color: Colors.black26, width: 0.5),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+  return SizedBox(
+    width: 14,
+    height: 10,
+    child: Center(
+      child: Container(
+        width: 10,
+        height: 10,
+        decoration: BoxDecoration(
+          color: _trailDifficultyColor(tier),
+          borderRadius: BorderRadius.circular(2),
+          border: Border.all(color: Colors.black26, width: 0.5),
+        ),
+      ),
+    ),
+  );
 }
 
 class RideEntry {
