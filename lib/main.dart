@@ -265,12 +265,11 @@ class _HomeScreenState extends State<HomeScreen> {
                               itemCount: filtered.length,
                               itemBuilder: (context, index) {
                                 final trail = filtered[index];
-                                final bucket = _trailDifficultyBucket(trail);
                                 return ListTile(
                                   title: Text(trail.name),
                                   subtitle: Text(
                                     '${trail.lengthKm.toStringAsFixed(1)} km · '
-                                    '${_trailDifficultyLabel(bucket)}',
+                                    '${_trailDifficultyDisplayLabel(trail)}',
                                   ),
                                   onTap: () {
                                     Navigator.of(sheetContext).pop();
