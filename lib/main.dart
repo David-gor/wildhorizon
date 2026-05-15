@@ -61,6 +61,40 @@ class _HomeScreenState extends State<HomeScreen> {
   final Distance _distance = const Distance();
   Timer? _mapViewSaveTimer;
 
+  static const LatLng _defaultMapCenter = LatLng(37.2606, -122.0890);
+  static const double _defaultMapZoom = 10.5;
+
+  bool _latLngIsValid(LatLng p) {
+    return p.latitude.isFinite &&
+        p.longitude.isFinite &&
+        p.latitude >= -90 &&
+        p.latitude <= 90 &&
+        p.longitude >= -180 &&
+        p.longitude <= 180;
+  }
+
+  bool _zoomIsValid(double z) => z.isFinite && z >= 1 && z <= 22;
+
+  void _resetMapViewToDefaults() {
+    _mapCenter = _defaultMapCenter;
+    _mapZoom = _defaultMapZoom;
+  }
+
+  void _ensureMapStateValid() {
+    if (!_latLngIsValid(_mapCenter) || !_zoomIsValid(_mapZoom)) {
+      _resetMapViewToDefaults();
+    }
+  }
+
+  bool _boundsFinite(LatLngBounds b) {
+    return b.north.isFinite &&
+        b.south.isFinite &&
+        b.east.isFinite &&
+        b.west.isFinite &&
+        _latLngIsValid(b.northWest) &&
+        _latLngIsValid(b.southEast);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -102,9 +136,17 @@ class _HomeScreenState extends State<HomeScreen> {
     final mapLng = double.tryParse(prefs.getString('map_center_lng') ?? '');
     final mapZoom = double.tryParse(prefs.getString('map_zoom') ?? '');
     if (mapLat != null && mapLng != null && mapZoom != null) {
-      _mapCenter = LatLng(mapLat, mapLng);
-      _mapZoom = mapZoom.clamp(3.0, 18.0);
-      restoredMap = true;
+      final c = LatLng(mapLat, mapLng);
+      final z = mapZoom.clamp(3.0, 18.0);
+      if (_latLngIsValid(c) && _zoomIsValid(z)) {
+        _mapCenter = c;
+        _mapZoom = z;
+        restoredMap = true;
+      } else {
+        await prefs.remove('map_center_lat');
+        await prefs.remove('map_center_lng');
+        await prefs.remove('map_zoom');
+      }
     }
 
     setState(() {});
@@ -120,6 +162,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _persistMapView() async {
+    if (!_latLngIsValid(_mapCenter) || !_zoomIsValid(_mapZoom)) {
+      return;
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('map_center_lat', _mapCenter.latitude.toString());
     await prefs.setString('map_center_lng', _mapCenter.longitude.toString());
@@ -164,10 +209,17 @@ class _HomeScreenState extends State<HomeScreen> {
           return;
         }
         final cam = _mapController.camera;
-        setState(() {
-          _mapCenter = cam.center;
-          _mapZoom = cam.zoom;
-        });
+        final c = cam.center;
+        final z = cam.zoom;
+        if (!_latLngIsValid(c) || !_zoomIsValid(z)) {
+          _resetMapViewToDefaults();
+          _mapController.move(_mapCenter, _mapZoom);
+        } else {
+          setState(() {
+            _mapCenter = c;
+            _mapZoom = z.clamp(3.0, 18.0);
+          });
+        }
         _schedulePersistMapView();
       });
     } catch (_) {
@@ -269,7 +321,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                   title: Text(trail.name),
                                   subtitle: Text(
                                     '${trail.lengthKm.toStringAsFixed(1)} km · '
-                                    '${_trailDifficultyDisplayLabel(trail)}',
+                                    '${_trailDifficultyLabel(_trailDifficultyBucket(trail))}',
                                   ),
                                   onTap: () {
                                     Navigator.of(sheetContext).pop();
@@ -533,8 +585,10 @@ class _HomeScreenState extends State<HomeScreen> {
         RideEntry(
           name: completed.name,
           notes:
-              'Finished trail (auto-saved). ${_trailDifficultyDisplayLabel(completed)} · '
-              '${completed.lengthKm.toStringAsFixed(2)} km · ${completed.highwayType}',
+              'Finished trail (auto-saved). ${_trailDifficultyLabel(_trailDifficultyBucket(completed))} · '
+              '${completed.lengthKm.toStringAsFixed(2)} km · ${completed.highwayType}'
+              '${completed.mtbScale != null ? ' · OSM ${completed.mtbScale}' : ''}'
+              '${completed.mtbScale == null && completed.mtbScaleImba != null ? ' · IMBA ${completed.mtbScaleImba}' : ''}',
         ),
       );
       if (!mounted) {
@@ -637,7 +691,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   Chip(
                     avatar: const Icon(Icons.terrain, size: 18),
                     label: Text(
-                      _trailDifficultyDisplayLabel(trail),
+                      '${_trailDifficultyLabel(_trailDifficultyBucket(trail))}'
+                      '${trail.mtbScale != null ? ' (OSM ${trail.mtbScale})' : ''}'
+                      '${trail.mtbScale == null && trail.mtbScaleImba != null ? ' (IMBA ${trail.mtbScaleImba})' : ''}',
                     ),
                   ),
                 ],
@@ -660,8 +716,10 @@ class _HomeScreenState extends State<HomeScreen> {
                     RideEntry(
                       name: trail.name,
                       notes:
-                          '${_trailDifficultyDisplayLabel(trail)} · '
-                          '${trail.lengthKm.toStringAsFixed(2)} km · ${trail.highwayType}',
+                          '${_trailDifficultyLabel(_trailDifficultyBucket(trail))} · '
+                          '${trail.lengthKm.toStringAsFixed(2)} km · ${trail.highwayType}'
+                          '${trail.mtbScale != null ? ' · OSM ${trail.mtbScale}' : ''}'
+                          '${trail.mtbScale == null && trail.mtbScaleImba != null ? ' · IMBA ${trail.mtbScaleImba}' : ''}',
                     ),
                   );
                   messenger.showSnackBar(
@@ -809,22 +867,30 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _loadTrails() async {
+    _ensureMapStateValid();
     setState(() {
       _isLoadingTrails = true;
       _trailError = null;
     });
 
-    final bounds = _mapController.camera.visibleBounds;
-    final hasBounds =
-        bounds.northWest.latitude != bounds.southEast.latitude &&
-        bounds.northWest.longitude != bounds.southEast.longitude;
+    LatLngBounds? bounds;
+    try {
+      final b = _mapController.camera.visibleBounds;
+      bounds = _boundsFinite(b) ? b : null;
+    } catch (_) {
+      bounds = null;
+    }
+    final bbox = bounds;
+    final hasBounds = bbox != null &&
+        bbox.northWest.latitude != bbox.southEast.latitude &&
+        bbox.northWest.longitude != bbox.southEast.longitude;
     // When bbox is unavailable, Overpass `around:` — cap to stay within API limits.
     final cappedRadiusMeters = _radiusMeters
         .clamp(1000, 100000)
         .toStringAsFixed(0);
 
     final spatial = hasBounds
-        ? '(${bounds.south.toStringAsFixed(6)},${bounds.west.toStringAsFixed(6)},${bounds.north.toStringAsFixed(6)},${bounds.east.toStringAsFixed(6)})'
+        ? '(${bbox.south.toStringAsFixed(6)},${bbox.west.toStringAsFixed(6)},${bbox.north.toStringAsFixed(6)},${bbox.east.toStringAsFixed(6)})'
         : '(around:$cappedRadiusMeters,${_mapCenter.latitude.toStringAsFixed(6)},${_mapCenter.longitude.toStringAsFixed(6)})';
 
     // Only ways that are explicitly for bikes / MTB in OSM (not generic paths).
@@ -948,8 +1014,6 @@ out geom;
             surface: tags['surface'] as String?,
             mtbScale: tags['mtb:scale'] as String?,
             mtbScaleImba: tags['mtb:scale:imba'] as String?,
-            osmSacScale: tags['sac_scale'] as String?,
-            tracktype: tags['tracktype'] as String?,
             lengthKm: lengthMeters / 1000,
           ),
         );
@@ -1091,9 +1155,12 @@ out geom;
                       onPositionChanged: (position, _) {
                         final center = position.center;
                         final zoom = position.zoom;
+                        if (!_latLngIsValid(center) || !_zoomIsValid(zoom)) {
+                          return;
+                        }
                         setState(() {
                           _mapCenter = center;
-                          _mapZoom = zoom;
+                          _mapZoom = zoom.clamp(3.0, 18.0);
                         });
                         _schedulePersistMapView();
                       },
@@ -1120,28 +1187,21 @@ out geom;
                       PolylineLayer(
                         polylines: _trails.map((trail) {
                           final selected = trail.osmId == _selectedTrailId;
-                          final tier = _trailDifficultyTier(trail);
-                          final lineColor = _trailDifficultyColor(tier);
+                          final bucket = _trailDifficultyBucket(trail);
+                          final lineColor = _trailDifficultyColor(bucket);
                           final baseWidth = _mapZoom >= 13
                               ? 5.0
                               : _mapZoom >= 11
                               ? 4.0
                               : 3.0;
-                          final expertDouble = !selected && tier == 3;
                           return Polyline(
                             points: trail.points,
                             color: lineColor,
-                            strokeWidth: selected
-                                ? baseWidth + 2
-                                : baseWidth + (expertDouble ? 0.5 : 0),
-                            borderStrokeWidth: selected
-                                ? 3.5
-                                : (expertDouble ? 2.25 : 0),
+                            strokeWidth: selected ? baseWidth + 2 : baseWidth,
+                            borderStrokeWidth: selected ? 3.5 : 0,
                             borderColor: selected
                                 ? Colors.yellowAccent.shade400
-                                : (expertDouble
-                                      ? const Color(0xFFE0E0E0)
-                                      : Colors.transparent),
+                                : Colors.transparent,
                           );
                         }).toList(),
                       ),
@@ -1278,16 +1338,29 @@ out geom;
                                       ?.copyWith(fontWeight: FontWeight.w600),
                                 ),
                                 const SizedBox(height: 4),
-                                for (final tier in const <int>[0, 1, 2, 3])
+                                for (var i = 0; i <= 6; i++)
                                   Padding(
                                     padding: const EdgeInsets.only(top: 2),
                                     child: Row(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.center,
                                       children: [
-                                        _trailDifficultyLegendSwatch(tier),
-                                        const SizedBox(width: 6),
-                                        Text(_trailDifficultyLabel(tier)),
+                                        Container(
+                                          width: 10,
+                                          height: 10,
+                                          margin: const EdgeInsets.only(
+                                            right: 6,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: _trailDifficultyColor(i),
+                                            borderRadius: BorderRadius.circular(
+                                              2,
+                                            ),
+                                            border: Border.all(
+                                              color: Colors.black26,
+                                              width: 0.5,
+                                            ),
+                                          ),
+                                        ),
+                                        Text(_trailDifficultyLabel(i)),
                                       ],
                                     ),
                                   ),
@@ -1297,11 +1370,27 @@ out geom;
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      _trailDifficultyLegendSwatch(-1),
-                                      const SizedBox(width: 6),
+                                      Container(
+                                        width: 10,
+                                        height: 10,
+                                        margin: const EdgeInsets.only(
+                                          right: 6,
+                                          top: 1,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: _trailDifficultyColor(-1),
+                                          borderRadius: BorderRadius.circular(
+                                            2,
+                                          ),
+                                          border: Border.all(
+                                            color: Colors.black26,
+                                            width: 0.5,
+                                          ),
+                                        ),
+                                      ),
                                       const Expanded(
                                         child: Text(
-                                          'Unrated — no MTB scale / sac_scale / tracktype / surface hint in OSM',
+                                          'Unrated — no difficulty tag in OpenStreetMap (grey lines)',
                                         ),
                                       ),
                                     ],
@@ -1655,98 +1744,8 @@ int? _parseImbaDigit(String? raw) {
   return int.tryParse(s[0]);
 }
 
-/// Rough MTB bucket 0–6 from OSM `sac_scale` (hiking scale) when `mtb:scale` is missing.
-int? _bucketFromOsmSacScaleTag(String? raw) {
-  if (raw == null) {
-    return null;
-  }
-  final s = raw.trim();
-  if (s.isEmpty) {
-    return null;
-  }
-  final lower = s.toLowerCase();
-  final t = RegExp(r'^[tT]\s*(\d)').firstMatch(lower);
-  if (t != null) {
-    final d = int.tryParse(t.group(1)!);
-    if (d != null) {
-      return (d - 1).clamp(0, 6);
-    }
-  }
-  switch (lower.replaceAll('-', '_')) {
-    case 'hiking':
-      return 0;
-    case 'mountain_hiking':
-      return 2;
-    case 'demanding_mountain_hiking':
-      return 3;
-    case 'alpine_hiking':
-      return 4;
-    case 'demanding_alpine_hiking':
-      return 5;
-    case 'difficult_alpine_hiking':
-      return 6;
-    default:
-      return null;
-  }
-}
-
-/// Rough MTB bucket from OSM `tracktype` (surface firmness of tracks).
-int? _bucketFromTracktype(String? raw) {
-  if (raw == null) {
-    return null;
-  }
-  final m = RegExp(
-    r'grade\s*(\d)',
-    caseSensitive: false,
-  ).firstMatch(raw.trim());
-  if (m == null) {
-    return null;
-  }
-  final d = int.tryParse(m.group(1)!);
-  if (d == null || d < 1 || d > 5) {
-    return null;
-  }
-  const gradeToBucket = <int, int>{1: 0, 2: 1, 3: 2, 4: 4, 5: 5};
-  return gradeToBucket[d];
-}
-
-/// Last-resort hint from `surface` when no better tags exist.
-int? _bucketFromSurfaceHint(String? raw) {
-  if (raw == null) {
-    return null;
-  }
-  final s = raw.trim().toLowerCase();
-  if (s.isEmpty) {
-    return null;
-  }
-  if (s.contains('paving') ||
-      s.contains('paved') ||
-      s.contains('asphalt') ||
-      s.contains('concrete') ||
-      s == 'paving_stones') {
-    return 0;
-  }
-  if (s.contains('gravel') ||
-      s.contains('compacted') ||
-      s.contains('fine_gravel')) {
-    return 1;
-  }
-  if (s == 'dirt' ||
-      s == 'earth' ||
-      s == 'ground' ||
-      s == 'grass' ||
-      s.contains('wood')) {
-    return 2;
-  }
-  if (s.contains('rock') || s.contains('mud') || s.contains('sand')) {
-    return 3;
-  }
-  return null;
-}
-
-/// Raw `mtb:scale` / IMBA-derived bucket 0–6, or -1 unrated, except [cycleway] → 0.
-/// Falls back to hiking [sac_scale], [tracktype], then [surface] when MTB tags are absent.
-int _trailSacMtbBucket(TrailData trail) {
+/// 0–6 = `mtb:scale` / mapped IMBA; -1 = unrated (grey), except [cycleway] → 0.
+int _trailDifficultyBucket(TrailData trail) {
   final sac = _parseSacScaleDigit(trail.mtbScale);
   if (sac != null) {
     return sac.clamp(0, 6);
@@ -1759,146 +1758,40 @@ int _trailSacMtbBucket(TrailData trail) {
   if (trail.highwayType.toLowerCase() == 'cycleway') {
     return 0;
   }
-  final fromSac = _bucketFromOsmSacScaleTag(trail.osmSacScale);
-  if (fromSac != null) {
-    return fromSac.clamp(0, 6);
-  }
-  final fromTrack = _bucketFromTracktype(trail.tracktype);
-  if (fromTrack != null) {
-    return fromTrack.clamp(0, 6);
-  }
-  final fromSurface = _bucketFromSurfaceHint(trail.surface);
-  if (fromSurface != null) {
-    return fromSurface.clamp(0, 6);
-  }
   return -1;
 }
 
-/// Ski-style display tier: -1 unrated, 0 beginner, 1 intermediate, 2 advanced, 3 expert.
-int _trailDifficultyTier(TrailData trail) {
-  final b = _trailSacMtbBucket(trail);
-  if (b < 0) {
-    return -1;
+Color _trailDifficultyColor(int bucket) {
+  if (bucket < 0) {
+    return const Color(0xFF546E7A);
   }
-  if (b <= 1) {
-    return 0;
-  }
-  if (b <= 3) {
-    return 1;
-  }
-  if (b <= 5) {
-    return 2;
-  }
-  return 3;
+  const colors = <Color>[
+    Color(0xFF1B5E20),
+    Color(0xFF388E3C),
+    Color(0xFF7CB342),
+    Color(0xFFF9A825),
+    Color(0xFFF57C00),
+    Color(0xFFD84315),
+    Color(0xFF4A148C),
+  ];
+  return colors[bucket.clamp(0, 6)];
 }
 
-Color _trailDifficultyColor(int tier) {
-  switch (tier) {
-    case -1:
-      return const Color(0xFFC62828);
-    case 0:
-      return const Color(0xFF2E7D32);
-    case 1:
-      return const Color(0xFF1565C0);
-    case 2:
-    case 3:
-      return const Color(0xFF000000);
-    default:
-      return const Color(0xFFC62828);
+/// Human-readable difficulty for map legend and trail sheet (from OSM bucket).
+String _trailDifficultyLabel(int bucket) {
+  if (bucket < 0) {
+    return 'Unrated';
   }
-}
-
-/// Labels for [tier] values from [_trailDifficultyTier] only.
-String _trailDifficultyLabel(int tier) {
-  switch (tier) {
-    case -1:
-      return 'Unrated';
-    case 0:
-      return 'Beginner';
-    case 1:
-      return 'Intermediate';
-    case 2:
-      return 'Advanced';
-    case 3:
-      return 'Expert';
-    default:
-      return 'Unrated';
-  }
-}
-
-/// True when difficulty comes from `mtb:scale` / `mtb:scale:imba` or a cycleway default.
-bool _trailDifficultyFromVerifiedOsmTags(TrailData trail) {
-  if (trail.highwayType.toLowerCase() == 'cycleway') {
-    return true;
-  }
-  if (_parseSacScaleDigit(trail.mtbScale) != null) {
-    return true;
-  }
-  if (_parseImbaDigit(trail.mtbScaleImba) != null) {
-    return true;
-  }
-  return false;
-}
-
-String _trailDifficultyDisplayLabel(TrailData trail) {
-  final tier = _trailDifficultyTier(trail);
-  final base = _trailDifficultyLabel(tier);
-  if (tier < 0 || _trailDifficultyFromVerifiedOsmTags(trail)) {
-    return base;
-  }
-  return '$base (est.)';
-}
-
-Widget _trailDifficultyLegendSwatch(int tier) {
-  if (tier == 3) {
-    return SizedBox(
-      width: 14,
-      height: 10,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Transform.rotate(
-            angle: math.pi / 4,
-            child: Container(
-              width: 5,
-              height: 5,
-              decoration: BoxDecoration(
-                color: Colors.black,
-                border: Border.all(color: Colors.black26, width: 0.5),
-              ),
-            ),
-          ),
-          const SizedBox(width: 2),
-          Transform.rotate(
-            angle: math.pi / 4,
-            child: Container(
-              width: 5,
-              height: 5,
-              decoration: BoxDecoration(
-                color: Colors.black,
-                border: Border.all(color: Colors.black26, width: 0.5),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-  return SizedBox(
-    width: 14,
-    height: 10,
-    child: Center(
-      child: Container(
-        width: 10,
-        height: 10,
-        decoration: BoxDecoration(
-          color: _trailDifficultyColor(tier),
-          borderRadius: BorderRadius.circular(2),
-          border: Border.all(color: Colors.black26, width: 0.5),
-        ),
-      ),
-    ),
-  );
+  const labels = <String>[
+    'Beginner',
+    'Easy',
+    'Intermediate',
+    'Advanced',
+    'Expert',
+    'Extreme',
+    'Pro',
+  ];
+  return labels[bucket.clamp(0, 6)];
 }
 
 class RideEntry {
@@ -1945,8 +1838,6 @@ class TrailData {
     this.surface,
     this.mtbScale,
     this.mtbScaleImba,
-    this.osmSacScale,
-    this.tracktype,
   });
 
   final int osmId;
@@ -1956,8 +1847,5 @@ class TrailData {
   final String? surface;
   final String? mtbScale;
   final String? mtbScaleImba;
-  /// Hiking `sac_scale` when `mtb:scale` is absent (OpenStreetMap).
-  final String? osmSacScale;
-  final String? tracktype;
   final double lengthKm;
 }
