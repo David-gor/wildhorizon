@@ -59,6 +59,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _trailCompletionSaved = false;
   double get _radiusMeters => _radiusMiles * 1609.34;
   final Distance _distance = const Distance();
+  Timer? _mapViewSaveTimer;
 
   @override
   void initState() {
@@ -68,6 +69,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _mapViewSaveTimer?.cancel();
+    unawaited(_persistMapView());
     _trailCompletionSubscription?.cancel();
     _riderNameController.dispose();
     _riderBikeController.dispose();
@@ -93,7 +96,260 @@ class _HomeScreenState extends State<HomeScreen> {
         _rides = [];
       }
     }
+
+    var restoredMap = false;
+    final mapLat = double.tryParse(prefs.getString('map_center_lat') ?? '');
+    final mapLng = double.tryParse(prefs.getString('map_center_lng') ?? '');
+    final mapZoom = double.tryParse(prefs.getString('map_zoom') ?? '');
+    if (mapLat != null && mapLng != null && mapZoom != null) {
+      _mapCenter = LatLng(mapLat, mapLng);
+      _mapZoom = mapZoom.clamp(3.0, 18.0);
+      restoredMap = true;
+    }
+
     setState(() {});
+
+    if (restoredMap) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+        _mapController.move(_mapCenter, _mapZoom);
+      });
+    }
+  }
+
+  Future<void> _persistMapView() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('map_center_lat', _mapCenter.latitude.toString());
+    await prefs.setString('map_center_lng', _mapCenter.longitude.toString());
+    await prefs.setString('map_zoom', _mapZoom.toString());
+  }
+
+  void _schedulePersistMapView() {
+    _mapViewSaveTimer?.cancel();
+    _mapViewSaveTimer = Timer(const Duration(milliseconds: 900), () {
+      unawaited(_persistMapView());
+    });
+  }
+
+  void _focusTrailOnMap(TrailData trail) {
+    if (trail.points.isEmpty) {
+      return;
+    }
+    setState(() {
+      _selectedTrailId = trail.osmId;
+    });
+    if (trail.points.length == 1) {
+      final p = trail.points.first;
+      _mapController.move(p, 15);
+      setState(() {
+        _mapCenter = p;
+        _mapZoom = 15;
+      });
+      _schedulePersistMapView();
+      return;
+    }
+    try {
+      final bounds = LatLngBounds.fromPoints(trail.points);
+      _mapController.fitCamera(
+        CameraFit.bounds(
+          bounds: bounds,
+          padding: const EdgeInsets.all(40),
+          maxZoom: 17,
+        ),
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+        final cam = _mapController.camera;
+        setState(() {
+          _mapCenter = cam.center;
+          _mapZoom = cam.zoom;
+        });
+        _schedulePersistMapView();
+      });
+    } catch (_) {
+      final mid = trail.points[trail.points.length ~/ 2];
+      _mapController.move(mid, 14);
+      setState(() {
+        _mapCenter = mid;
+        _mapZoom = 14;
+      });
+      _schedulePersistMapView();
+    }
+  }
+
+  Future<void> _showBrowseTrailsSheet() async {
+    if (_trails.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No trails loaded yet — pan to your area and tap refresh.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    final searchController = TextEditingController();
+
+    if (!mounted) {
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.52,
+          minChildSize: 0.28,
+          maxChildSize: 0.92,
+          builder: (dragContext, scrollController) {
+            return StatefulBuilder(
+              builder: (context, setModalState) {
+                final q = searchController.text.trim().toLowerCase();
+                final sorted = [..._trails]..sort(
+                    (a, b) =>
+                        a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+                  );
+                final filtered = q.isEmpty
+                    ? sorted
+                    : sorted
+                          .where((t) => t.name.toLowerCase().contains(q))
+                          .toList();
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                      child: Text(
+                        'Browse trails',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: TextField(
+                        controller: searchController,
+                        decoration: const InputDecoration(
+                          prefixIcon: Icon(Icons.search),
+                          hintText: 'Search by name',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        onChanged: (_) => setModalState(() {}),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: filtered.isEmpty
+                          ? Center(
+                              child: Padding(
+                                padding: const EdgeInsets.all(24),
+                                child: Text(
+                                  'No trails match “${searchController.text.trim()}”.',
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                            )
+                          : ListView.builder(
+                              controller: scrollController,
+                              itemCount: filtered.length,
+                              itemBuilder: (context, index) {
+                                final trail = filtered[index];
+                                final bucket = _trailDifficultyBucket(trail);
+                                return ListTile(
+                                  title: Text(trail.name),
+                                  subtitle: Text(
+                                    '${trail.lengthKm.toStringAsFixed(1)} km · '
+                                    '${_trailDifficultyLabel(bucket)}',
+                                  ),
+                                  onTap: () {
+                                    Navigator.of(sheetContext).pop();
+                                    _focusTrailOnMap(trail);
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+    searchController.dispose();
+  }
+
+  void _tryFocusTrailFromSearchQuery(String raw) {
+    final q = raw.trim().toLowerCase();
+    if (q.isEmpty) {
+      return;
+    }
+    if (_trails.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Load trails first — tap refresh on the map.'),
+        ),
+      );
+      return;
+    }
+
+    TrailData? exact;
+    for (final t in _trails) {
+      if (t.name.toLowerCase() == q) {
+        exact = t;
+        break;
+      }
+    }
+    if (exact != null) {
+      _focusTrailOnMap(exact);
+      return;
+    }
+
+    final partial = _trails
+        .where((t) => t.name.toLowerCase().contains(q))
+        .toList();
+    if (partial.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('No trail matches “$raw”.')),
+      );
+      return;
+    }
+    partial.sort((a, b) {
+      final byLen = a.name.length.compareTo(b.name.length);
+      if (byLen != 0) {
+        return byLen;
+      }
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    _focusTrailOnMap(partial.first);
+    if (partial.length > 1 && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${partial.length} trails match — opened the shortest name. '
+            'Use suggestions or Browse trails to pick another.',
+          ),
+        ),
+      );
+    }
   }
 
   Future<void> _persistRides() async {
@@ -742,10 +998,75 @@ out geom;
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 8),
-          ElevatedButton.icon(
-            onPressed: _showAddRideDialog,
-            icon: const Icon(Icons.add_road),
-            label: const Text('Add ride'),
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _showAddRideDialog,
+                  icon: const Icon(Icons.add_road),
+                  label: const Text('Add ride'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: _showBrowseTrailsSheet,
+                  icon: const Icon(Icons.list_alt_outlined),
+                  label: const Text('Browse trails'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Autocomplete<TrailData>(
+            displayStringForOption: (trail) => trail.name,
+            optionsBuilder: (TextEditingValue value) {
+              final q = value.text.trim().toLowerCase();
+              if (q.isEmpty || _trails.isEmpty) {
+                return const Iterable<TrailData>.empty();
+              }
+              final list = _trails
+                  .where((t) => t.name.toLowerCase().contains(q))
+                  .toList();
+              list.sort(
+                (a, b) =>
+                    a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+              );
+              return list.take(20);
+            },
+            onSelected: (trail) {
+              _focusTrailOnMap(trail);
+              FocusManager.instance.primaryFocus?.unfocus();
+            },
+            fieldViewBuilder:
+                (context, textController, focusNode, onFieldSubmitted) {
+              return TextField(
+                controller: textController,
+                focusNode: focusNode,
+                textInputAction: TextInputAction.search,
+                decoration: InputDecoration(
+                  labelText: 'Search trail on map',
+                  hintText: 'Type name, choose a suggestion, or press search',
+                  border: const OutlineInputBorder(),
+                  prefixIcon: const Icon(Icons.search),
+                  suffixIcon: textController.text.isEmpty
+                      ? null
+                      : IconButton(
+                          tooltip: 'Clear',
+                          icon: const Icon(Icons.clear),
+                          onPressed: () {
+                            textController.clear();
+                            setState(() {});
+                          },
+                        ),
+                ),
+                onChanged: (_) => setState(() {}),
+                onSubmitted: (value) {
+                  _tryFocusTrailFromSearchQuery(value);
+                  FocusManager.instance.primaryFocus?.unfocus();
+                },
+              );
+            },
           ),
           const SizedBox(height: 12),
           Expanded(
@@ -775,6 +1096,7 @@ out geom;
                           _mapCenter = center;
                           _mapZoom = zoom;
                         });
+                        _schedulePersistMapView();
                       },
                       onTap: _onMapTap,
                     ),
