@@ -50,6 +50,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoadingTrails = false;
   String? _trailError;
   List<TrailData> _trails = [];
+  List<FavoriteTrail> _favoriteTrails = [];
   int? _selectedTrailId;
 
   StreamSubscription<Position>? _trailCompletionSubscription;
@@ -131,6 +132,18 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
 
+    final favRaw = prefs.getString('favorite_trails_v1');
+    if (favRaw != null && favRaw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(favRaw) as List<dynamic>;
+        _favoriteTrails = decoded
+            .map((e) => FavoriteTrail.fromJson(e as Map<String, dynamic>))
+            .toList();
+      } catch (_) {
+        _favoriteTrails = [];
+      }
+    }
+
     var restoredMap = false;
     final mapLat = double.tryParse(prefs.getString('map_center_lat') ?? '');
     final mapLng = double.tryParse(prefs.getString('map_center_lng') ?? '');
@@ -176,6 +189,190 @@ class _HomeScreenState extends State<HomeScreen> {
     _mapViewSaveTimer = Timer(const Duration(milliseconds: 900), () {
       unawaited(_persistMapView());
     });
+  }
+
+  Future<void> _persistFavorites() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      'favorite_trails_v1',
+      jsonEncode(_favoriteTrails.map((f) => f.toJson()).toList()),
+    );
+  }
+
+  bool _isFavorite(int osmId) =>
+      _favoriteTrails.any((f) => f.osmId == osmId);
+
+  LatLng _trailCenter(TrailData trail) {
+    if (trail.points.isEmpty) {
+      return _mapCenter;
+    }
+    if (trail.points.length == 1) {
+      return trail.points.first;
+    }
+    return trail.points[trail.points.length ~/ 2];
+  }
+
+  Future<void> _toggleFavorite(TrailData trail) async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_isFavorite(trail.osmId)) {
+      setState(() {
+        _favoriteTrails.removeWhere((f) => f.osmId == trail.osmId);
+      });
+      await _persistFavorites();
+      if (!mounted) {
+        return;
+      }
+      messenger.showSnackBar(
+        SnackBar(content: Text('Removed "${trail.name}" from favorites')),
+      );
+      return;
+    }
+    final center = _trailCenter(trail);
+    setState(() {
+      _favoriteTrails.insert(
+        0,
+        FavoriteTrail(
+          osmId: trail.osmId,
+          name: trail.name,
+          latitude: center.latitude,
+          longitude: center.longitude,
+          lengthKm: trail.lengthKm,
+        ),
+      );
+    });
+    await _persistFavorites();
+    if (!mounted) {
+      return;
+    }
+    messenger.showSnackBar(
+      SnackBar(content: Text('Saved "${trail.name}" to favorites')),
+    );
+  }
+
+  void _openFavorite(FavoriteTrail favorite) {
+    setState(() {
+      _navIndex = 0;
+    });
+    TrailData? loaded;
+    for (final t in _trails) {
+      if (t.osmId == favorite.osmId) {
+        loaded = t;
+        break;
+      }
+    }
+    if (loaded != null) {
+      _focusTrailOnMap(loaded);
+      _showTrailDetails(loaded);
+      return;
+    }
+    final p = LatLng(favorite.latitude, favorite.longitude);
+    if (!_latLngIsValid(p)) {
+      return;
+    }
+    _mapController.move(p, 14);
+    setState(() {
+      _mapCenter = p;
+      _mapZoom = 14;
+      _selectedTrailId = null;
+    });
+    _schedulePersistMapView();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Jumped to saved spot — tap refresh on the map if the trail line is not visible.',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _removeFavorite(FavoriteTrail favorite) async {
+    setState(() {
+      _favoriteTrails.removeWhere((f) => f.osmId == favorite.osmId);
+    });
+    await _persistFavorites();
+  }
+
+  Future<void> _showFavoritesSheet() async {
+    if (!mounted) {
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.52,
+          minChildSize: 0.28,
+          maxChildSize: 0.92,
+          builder: (dragContext, scrollController) {
+            return StatefulBuilder(
+              builder: (context, setModalState) {
+                final sorted = [..._favoriteTrails]
+                  ..sort((a, b) => b.savedAt.compareTo(a.savedAt));
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                      child: Text(
+                        'Favorite trails',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ),
+                    Expanded(
+                      child: sorted.isEmpty
+                          ? Center(
+                              child: Padding(
+                                padding: const EdgeInsets.all(24),
+                                child: Text(
+                                  'No favorites yet.\nTap a trail on the map, then the star to save it here.',
+                                  textAlign: TextAlign.center,
+                                  style: Theme.of(context).textTheme.bodyMedium,
+                                ),
+                              ),
+                            )
+                          : ListView.builder(
+                              controller: scrollController,
+                              itemCount: sorted.length,
+                              itemBuilder: (context, index) {
+                                final fav = sorted[index];
+                                final subtitle = fav.lengthKm != null
+                                    ? '${fav.lengthKm!.toStringAsFixed(1)} km'
+                                    : 'Saved ${fav.savedLabel()}';
+                                return ListTile(
+                                  leading: const Icon(
+                                    Icons.star,
+                                    color: Colors.amber,
+                                  ),
+                                  title: Text(fav.name),
+                                  subtitle: Text(subtitle),
+                                  onTap: () {
+                                    Navigator.of(sheetContext).pop();
+                                    _openFavorite(fav);
+                                  },
+                                  trailing: IconButton(
+                                    icon: const Icon(Icons.delete_outline),
+                                    tooltip: 'Remove favorite',
+                                    onPressed: () async {
+                                      await _removeFavorite(fav);
+                                      setModalState(() {});
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                );
+              },
+            );
+          },
+        );
+      },
+    );
   }
 
   void _focusTrailOnMap(TrailData trail) {
@@ -318,6 +515,14 @@ class _HomeScreenState extends State<HomeScreen> {
                               itemBuilder: (context, index) {
                                 final trail = filtered[index];
                                 return ListTile(
+                                  leading: Icon(
+                                    _isFavorite(trail.osmId)
+                                        ? Icons.star
+                                        : Icons.star_border,
+                                    color: _isFavorite(trail.osmId)
+                                        ? Colors.amber
+                                        : null,
+                                  ),
                                   title: Text(trail.name),
                                   subtitle: Text(
                                     '${trail.lengthKm.toStringAsFixed(1)} km · '
@@ -326,6 +531,10 @@ class _HomeScreenState extends State<HomeScreen> {
                                   onTap: () {
                                     Navigator.of(sheetContext).pop();
                                     _focusTrailOnMap(trail);
+                                  },
+                                  onLongPress: () async {
+                                    await _toggleFavorite(trail);
+                                    setModalState(() {});
                                   },
                                 );
                               },
@@ -586,7 +795,9 @@ class _HomeScreenState extends State<HomeScreen> {
           name: completed.name,
           notes:
               'Finished trail (auto-saved). ${_trailDifficultyDisplayLabel(completed)} · '
-              '${completed.lengthKm.toStringAsFixed(2)} km · ${completed.highwayType}',
+              '${completed.lengthKm.toStringAsFixed(2)} km · ${completed.highwayType}'
+              '${completed.mtbScale != null ? ' · OSM ${completed.mtbScale}' : ''}'
+              '${completed.mtbScale == null && completed.mtbScaleImba != null ? ' · IMBA ${completed.mtbScaleImba}' : ''}',
         ),
       );
       if (!mounted) {
@@ -660,17 +871,40 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       showDragHandle: true,
       builder: (sheetContext) {
-        return Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                trail.name,
-                style: Theme.of(sheetContext).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 10),
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            final isFavorite = _isFavorite(trail.osmId);
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          trail.name,
+                          style: Theme.of(sheetContext).textTheme.titleLarge,
+                        ),
+                      ),
+                      IconButton(
+                        icon: Icon(
+                          isFavorite ? Icons.star : Icons.star_border,
+                          color: isFavorite ? Colors.amber.shade700 : null,
+                        ),
+                        tooltip: isFavorite
+                            ? 'Remove from favorites'
+                            : 'Add to favorites',
+                        onPressed: () async {
+                          await _toggleFavorite(trail);
+                          setSheetState(() {});
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
               Text(
                 'Track & auto-save: go near the trail start, then the finish. '
                 'Your ride is saved automatically when you reach the end. '
@@ -713,7 +947,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       name: trail.name,
                       notes:
                           '${_trailDifficultyDisplayLabel(trail)} · '
-                          '${trail.lengthKm.toStringAsFixed(2)} km · ${trail.highwayType}',
+                          '${trail.lengthKm.toStringAsFixed(2)} km · ${trail.highwayType}'
+                          '${trail.mtbScale != null ? ' · OSM ${trail.mtbScale}' : ''}'
+                          '${trail.mtbScale == null && trail.mtbScaleImba != null ? ' · IMBA ${trail.mtbScaleImba}' : ''}',
                     ),
                   );
                   messenger.showSnackBar(
@@ -723,8 +959,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 icon: const Icon(Icons.bookmark_add_outlined),
                 label: const Text('Add to my rides now'),
               ),
-            ],
-          ),
+                ],
+              ),
+            );
+          },
         );
       },
     );
@@ -1008,8 +1246,6 @@ out geom;
             surface: tags['surface'] as String?,
             mtbScale: tags['mtb:scale'] as String?,
             mtbScaleImba: tags['mtb:scale:imba'] as String?,
-            osmSacScale: tags['sac_scale'] as String?,
-            tracktype: tags['tracktype'] as String?,
             lengthKm: lengthMeters / 1000,
           ),
         );
@@ -1057,21 +1293,31 @@ out geom;
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 8),
+          ElevatedButton.icon(
+            onPressed: _showAddRideDialog,
+            icon: const Icon(Icons.add_road),
+            label: const Text('Add ride'),
+          ),
+          const SizedBox(height: 8),
           Row(
             children: [
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: _showAddRideDialog,
-                  icon: const Icon(Icons.add_road),
-                  label: const Text('Add ride'),
-                ),
-              ),
-              const SizedBox(width: 8),
               Expanded(
                 child: FilledButton.tonalIcon(
                   onPressed: _showBrowseTrailsSheet,
                   icon: const Icon(Icons.list_alt_outlined),
                   label: const Text('Browse trails'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: _showFavoritesSheet,
+                  icon: const Icon(Icons.star_outline),
+                  label: Text(
+                    _favoriteTrails.isEmpty
+                        ? 'Favorites'
+                        : 'Favorites (${_favoriteTrails.length})',
+                  ),
                 ),
               ),
             ],
@@ -1336,7 +1582,7 @@ out geom;
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 Text(
-                                  'Line color = difficulty',
+                                  'Trail difficulty (ski-style colors)',
                                   style: Theme.of(context).textTheme.labelMedium
                                       ?.copyWith(fontWeight: FontWeight.w600),
                                 ),
@@ -1345,12 +1591,14 @@ out geom;
                                   Padding(
                                     padding: const EdgeInsets.only(top: 2),
                                     child: Row(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.center,
                                       children: [
-                                        _trailDifficultyLegendSwatch(tier),
+                                        _DifficultyLegendSwatch(tier: tier),
                                         const SizedBox(width: 6),
-                                        Text(_trailDifficultyLabel(tier)),
+                                        Expanded(
+                                          child: Text(
+                                            _trailDifficultyLabel(tier),
+                                          ),
+                                        ),
                                       ],
                                     ),
                                   ),
@@ -1360,11 +1608,11 @@ out geom;
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      _trailDifficultyLegendSwatch(-1),
+                                      _DifficultyLegendSwatch(tier: -1),
                                       const SizedBox(width: 6),
                                       const Expanded(
                                         child: Text(
-                                          'Unrated — no MTB scale / sac_scale / tracktype / surface hint in OSM',
+                                          'Unrated — no difficulty tag in OpenStreetMap (grey lines)',
                                         ),
                                       ),
                                     ],
@@ -1515,7 +1763,7 @@ out geom;
         const SizedBox(height: 8),
         Text(
           'WildHorizon loads bike trails from OpenStreetMap (Overpass). '
-          'Ride list and rider profile are stored locally with SharedPreferences.',
+          'Rides, favorites, and rider profile are stored locally on this device.',
           style: theme.textTheme.bodyMedium,
         ),
       ],
@@ -1718,98 +1966,8 @@ int? _parseImbaDigit(String? raw) {
   return int.tryParse(s[0]);
 }
 
-/// Rough MTB bucket 0–6 from OSM `sac_scale` (hiking scale) when `mtb:scale` is missing.
-int? _bucketFromOsmSacScaleTag(String? raw) {
-  if (raw == null) {
-    return null;
-  }
-  final s = raw.trim();
-  if (s.isEmpty) {
-    return null;
-  }
-  final lower = s.toLowerCase();
-  final t = RegExp(r'^[tT]\s*(\d)').firstMatch(lower);
-  if (t != null) {
-    final d = int.tryParse(t.group(1)!);
-    if (d != null) {
-      return (d - 1).clamp(0, 6);
-    }
-  }
-  switch (lower.replaceAll('-', '_')) {
-    case 'hiking':
-      return 0;
-    case 'mountain_hiking':
-      return 2;
-    case 'demanding_mountain_hiking':
-      return 3;
-    case 'alpine_hiking':
-      return 4;
-    case 'demanding_alpine_hiking':
-      return 5;
-    case 'difficult_alpine_hiking':
-      return 6;
-    default:
-      return null;
-  }
-}
-
-/// Rough MTB bucket from OSM `tracktype` (surface firmness of tracks).
-int? _bucketFromTracktype(String? raw) {
-  if (raw == null) {
-    return null;
-  }
-  final m = RegExp(
-    r'grade\s*(\d)',
-    caseSensitive: false,
-  ).firstMatch(raw.trim());
-  if (m == null) {
-    return null;
-  }
-  final d = int.tryParse(m.group(1)!);
-  if (d == null || d < 1 || d > 5) {
-    return null;
-  }
-  const gradeToBucket = <int, int>{1: 0, 2: 1, 3: 2, 4: 4, 5: 5};
-  return gradeToBucket[d];
-}
-
-/// Last-resort hint from `surface` when no better tags exist.
-int? _bucketFromSurfaceHint(String? raw) {
-  if (raw == null) {
-    return null;
-  }
-  final s = raw.trim().toLowerCase();
-  if (s.isEmpty) {
-    return null;
-  }
-  if (s.contains('paving') ||
-      s.contains('paved') ||
-      s.contains('asphalt') ||
-      s.contains('concrete') ||
-      s == 'paving_stones') {
-    return 0;
-  }
-  if (s.contains('gravel') ||
-      s.contains('compacted') ||
-      s.contains('fine_gravel')) {
-    return 1;
-  }
-  if (s == 'dirt' ||
-      s == 'earth' ||
-      s == 'ground' ||
-      s == 'grass' ||
-      s.contains('wood')) {
-    return 2;
-  }
-  if (s.contains('rock') || s.contains('mud') || s.contains('sand')) {
-    return 3;
-  }
-  return null;
-}
-
-/// Raw `mtb:scale` / IMBA-derived bucket 0–6, or -1 unrated, except [cycleway] → 0.
-/// Falls back to hiking [sac_scale], [tracktype], then [surface] when MTB tags are absent.
-int _trailSacMtbBucket(TrailData trail) {
+/// 0–6 = `mtb:scale` / mapped IMBA; -1 = unrated (grey), except [cycleway] → 0.
+int _trailDifficultyBucket(TrailData trail) {
   final sac = _parseSacScaleDigit(trail.mtbScale);
   if (sac != null) {
     return sac.clamp(0, 6);
@@ -1822,146 +1980,89 @@ int _trailSacMtbBucket(TrailData trail) {
   if (trail.highwayType.toLowerCase() == 'cycleway') {
     return 0;
   }
-  final fromSac = _bucketFromOsmSacScaleTag(trail.osmSacScale);
-  if (fromSac != null) {
-    return fromSac.clamp(0, 6);
-  }
-  final fromTrack = _bucketFromTracktype(trail.tracktype);
-  if (fromTrack != null) {
-    return fromTrack.clamp(0, 6);
-  }
-  final fromSurface = _bucketFromSurfaceHint(trail.surface);
-  if (fromSurface != null) {
-    return fromSurface.clamp(0, 6);
-  }
   return -1;
 }
 
-/// Ski-style display tier: -1 unrated, 0 beginner, 1 intermediate, 2 advanced, 3 expert.
-int _trailDifficultyTier(TrailData trail) {
-  final b = _trailSacMtbBucket(trail);
-  if (b < 0) {
-    return -1;
+Color _trailDifficultyColor(int bucket) {
+  if (bucket < 0) {
+    return const Color(0xFF546E7A);
   }
-  if (b <= 1) {
-    return 0;
-  }
-  if (b <= 3) {
-    return 1;
-  }
-  if (b <= 5) {
-    return 2;
-  }
-  return 3;
+  const colors = <Color>[
+    Color(0xFF1B5E20),
+    Color(0xFF388E3C),
+    Color(0xFF7CB342),
+    Color(0xFFF9A825),
+    Color(0xFFF57C00),
+    Color(0xFFD84315),
+    Color(0xFF4A148C),
+  ];
+  return colors[bucket.clamp(0, 6)];
 }
 
-Color _trailDifficultyColor(int tier) {
-  switch (tier) {
-    case -1:
-      return const Color(0xFFC62828);
-    case 0:
-      return const Color(0xFF2E7D32);
-    case 1:
-      return const Color(0xFF1565C0);
-    case 2:
-    case 3:
-      return const Color(0xFF000000);
-    default:
-      return const Color(0xFFC62828);
+/// Human-readable difficulty for map legend and trail sheet (from OSM bucket).
+String _trailDifficultyLabel(int bucket) {
+  if (bucket < 0) {
+    return 'Unrated';
   }
+  const labels = <String>[
+    'Beginner',
+    'Easy',
+    'Intermediate',
+    'Advanced',
+    'Expert',
+    'Extreme',
+    'Pro',
+  ];
+  return labels[bucket.clamp(0, 6)];
 }
 
-/// Labels for [tier] values from [_trailDifficultyTier] only.
-String _trailDifficultyLabel(int tier) {
-  switch (tier) {
-    case -1:
-      return 'Unrated';
-    case 0:
-      return 'Beginner';
-    case 1:
-      return 'Intermediate';
-    case 2:
-      return 'Advanced';
-    case 3:
-      return 'Expert';
-    default:
-      return 'Unrated';
-  }
-}
+class FavoriteTrail {
+  FavoriteTrail({
+    required this.osmId,
+    required this.name,
+    required this.latitude,
+    required this.longitude,
+    this.lengthKm,
+    DateTime? savedAt,
+  }) : savedAt = savedAt ?? DateTime.now();
 
-/// True when difficulty comes from `mtb:scale` / `mtb:scale:imba` or a cycleway default.
-bool _trailDifficultyFromVerifiedOsmTags(TrailData trail) {
-  if (trail.highwayType.toLowerCase() == 'cycleway') {
-    return true;
-  }
-  if (_parseSacScaleDigit(trail.mtbScale) != null) {
-    return true;
-  }
-  if (_parseImbaDigit(trail.mtbScaleImba) != null) {
-    return true;
-  }
-  return false;
-}
+  final int osmId;
+  final String name;
+  final double latitude;
+  final double longitude;
+  final double? lengthKm;
+  final DateTime savedAt;
 
-String _trailDifficultyDisplayLabel(TrailData trail) {
-  final tier = _trailDifficultyTier(trail);
-  final base = _trailDifficultyLabel(tier);
-  if (tier < 0 || _trailDifficultyFromVerifiedOsmTags(trail)) {
-    return base;
+  String savedLabel() {
+    final d = savedAt;
+    final m = d.month.toString().padLeft(2, '0');
+    final day = d.day.toString().padLeft(2, '0');
+    return '${d.year}-$m-$day';
   }
-  return '$base (est.)';
-}
 
-Widget _trailDifficultyLegendSwatch(int tier) {
-  if (tier == 3) {
-    return SizedBox(
-      width: 14,
-      height: 10,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Transform.rotate(
-            angle: math.pi / 4,
-            child: Container(
-              width: 5,
-              height: 5,
-              decoration: BoxDecoration(
-                color: Colors.black,
-                border: Border.all(color: Colors.black26, width: 0.5),
-              ),
-            ),
-          ),
-          const SizedBox(width: 2),
-          Transform.rotate(
-            angle: math.pi / 4,
-            child: Container(
-              width: 5,
-              height: 5,
-              decoration: BoxDecoration(
-                color: Colors.black,
-                border: Border.all(color: Colors.black26, width: 0.5),
-              ),
-            ),
-          ),
-        ],
-      ),
+  Map<String, dynamic> toJson() => {
+    'osmId': osmId,
+    'name': name,
+    'latitude': latitude,
+    'longitude': longitude,
+    if (lengthKm != null) 'lengthKm': lengthKm,
+    'savedAt': savedAt.toIso8601String(),
+  };
+
+  factory FavoriteTrail.fromJson(Map<String, dynamic> json) {
+    final osmRaw = json['osmId'];
+    final lat = (json['latitude'] as num?)?.toDouble();
+    final lng = (json['longitude'] as num?)?.toDouble();
+    return FavoriteTrail(
+      osmId: osmRaw is int ? osmRaw : (osmRaw as num).toInt(),
+      name: (json['name'] as String?)?.trim() ?? 'Trail',
+      latitude: lat ?? 0,
+      longitude: lng ?? 0,
+      lengthKm: (json['lengthKm'] as num?)?.toDouble(),
+      savedAt:
+          DateTime.tryParse(json['savedAt'] as String? ?? '') ?? DateTime.now(),
     );
   }
-  return SizedBox(
-    width: 14,
-    height: 10,
-    child: Center(
-      child: Container(
-        width: 10,
-        height: 10,
-        decoration: BoxDecoration(
-          color: _trailDifficultyColor(tier),
-          borderRadius: BorderRadius.circular(2),
-          border: Border.all(color: Colors.black26, width: 0.5),
-        ),
-      ),
-    ),
-  );
 }
 
 class RideEntry {
@@ -2008,8 +2109,6 @@ class TrailData {
     this.surface,
     this.mtbScale,
     this.mtbScaleImba,
-    this.osmSacScale,
-    this.tracktype,
   });
 
   final int osmId;
@@ -2019,8 +2118,5 @@ class TrailData {
   final String? surface;
   final String? mtbScale;
   final String? mtbScaleImba;
-  /// Hiking `sac_scale` when `mtb:scale` is absent (OpenStreetMap).
-  final String? osmSacScale;
-  final String? tracktype;
   final double lengthKm;
 }
