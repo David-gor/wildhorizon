@@ -2,6 +2,8 @@
 
 Git syncs **commits on GitHub**, not your two laptop folders directly. Same commands for everyone—only the `cd` path differs.
 
+**David’s machine:** the real repo with `.git` is **`~/Developer/mtb_app`**. A partial copy under `~/Documents/mtb_app` is not the Git project—open **`Developer/mtb_app`** in Cursor and run Flutter from there.
+
 ---
 
 ## One-time (each person)
