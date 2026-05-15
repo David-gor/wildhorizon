@@ -278,7 +278,7 @@ class _HomeScreenState extends State<HomeScreen> {
         RideEntry(
           name: completed.name,
           notes:
-              'Finished trail (auto-saved). ${_trailDifficultyLabel(_trailDifficultyTier(completed))} · '
+              'Finished trail (auto-saved). ${_trailDifficultyDisplayLabel(completed)} · '
               '${completed.lengthKm.toStringAsFixed(2)} km · ${completed.highwayType}',
         ),
       );
@@ -382,7 +382,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   Chip(
                     avatar: const Icon(Icons.terrain, size: 18),
                     label: Text(
-                      _trailDifficultyLabel(_trailDifficultyTier(trail)),
+                      _trailDifficultyDisplayLabel(trail),
                     ),
                   ),
                 ],
@@ -405,7 +405,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     RideEntry(
                       name: trail.name,
                       notes:
-                          '${_trailDifficultyLabel(_trailDifficultyTier(trail))} · '
+                          '${_trailDifficultyDisplayLabel(trail)} · '
                           '${trail.lengthKm.toStringAsFixed(2)} km · ${trail.highwayType}',
                     ),
                   );
@@ -693,6 +693,8 @@ out geom;
             surface: tags['surface'] as String?,
             mtbScale: tags['mtb:scale'] as String?,
             mtbScaleImba: tags['mtb:scale:imba'] as String?,
+            osmSacScale: tags['sac_scale'] as String?,
+            tracktype: tags['tracktype'] as String?,
             lengthKm: lengthMeters / 1000,
           ),
         );
@@ -978,7 +980,7 @@ out geom;
                                       const SizedBox(width: 6),
                                       const Expanded(
                                         child: Text(
-                                          'Unrated — no difficulty tag in OpenStreetMap',
+                                          'Unrated — no MTB scale / sac_scale / tracktype / surface hint in OSM',
                                         ),
                                       ),
                                     ],
@@ -1332,7 +1334,97 @@ int? _parseImbaDigit(String? raw) {
   return int.tryParse(s[0]);
 }
 
+/// Rough MTB bucket 0–6 from OSM `sac_scale` (hiking scale) when `mtb:scale` is missing.
+int? _bucketFromOsmSacScaleTag(String? raw) {
+  if (raw == null) {
+    return null;
+  }
+  final s = raw.trim();
+  if (s.isEmpty) {
+    return null;
+  }
+  final lower = s.toLowerCase();
+  final t = RegExp(r'^[tT]\s*(\d)').firstMatch(lower);
+  if (t != null) {
+    final d = int.tryParse(t.group(1)!);
+    if (d != null) {
+      return (d - 1).clamp(0, 6);
+    }
+  }
+  switch (lower.replaceAll('-', '_')) {
+    case 'hiking':
+      return 0;
+    case 'mountain_hiking':
+      return 2;
+    case 'demanding_mountain_hiking':
+      return 3;
+    case 'alpine_hiking':
+      return 4;
+    case 'demanding_alpine_hiking':
+      return 5;
+    case 'difficult_alpine_hiking':
+      return 6;
+    default:
+      return null;
+  }
+}
+
+/// Rough MTB bucket from OSM `tracktype` (surface firmness of tracks).
+int? _bucketFromTracktype(String? raw) {
+  if (raw == null) {
+    return null;
+  }
+  final m = RegExp(
+    r'grade\s*(\d)',
+    caseSensitive: false,
+  ).firstMatch(raw.trim());
+  if (m == null) {
+    return null;
+  }
+  final d = int.tryParse(m.group(1)!);
+  if (d == null || d < 1 || d > 5) {
+    return null;
+  }
+  const gradeToBucket = <int, int>{1: 0, 2: 1, 3: 2, 4: 4, 5: 5};
+  return gradeToBucket[d];
+}
+
+/// Last-resort hint from `surface` when no better tags exist.
+int? _bucketFromSurfaceHint(String? raw) {
+  if (raw == null) {
+    return null;
+  }
+  final s = raw.trim().toLowerCase();
+  if (s.isEmpty) {
+    return null;
+  }
+  if (s.contains('paving') ||
+      s.contains('paved') ||
+      s.contains('asphalt') ||
+      s.contains('concrete') ||
+      s == 'paving_stones') {
+    return 0;
+  }
+  if (s.contains('gravel') ||
+      s.contains('compacted') ||
+      s.contains('fine_gravel')) {
+    return 1;
+  }
+  if (s == 'dirt' ||
+      s == 'earth' ||
+      s == 'ground' ||
+      s == 'grass' ||
+      s.contains('wood')) {
+    return 2;
+  }
+  if (s.contains('rock') || s.contains('mud') || s.contains('sand')) {
+    return 3;
+  }
+  return null;
+}
+
 /// Raw `mtb:scale` / IMBA-derived bucket 0–6, or -1 unrated, except [cycleway] → 0.
+/// Falls back to hiking [sac_scale], [tracktype], then [surface] when MTB tags are absent.
 int _trailSacMtbBucket(TrailData trail) {
   final sac = _parseSacScaleDigit(trail.mtbScale);
   if (sac != null) {
@@ -1345,6 +1437,18 @@ int _trailSacMtbBucket(TrailData trail) {
   }
   if (trail.highwayType.toLowerCase() == 'cycleway') {
     return 0;
+  }
+  final fromSac = _bucketFromOsmSacScaleTag(trail.osmSacScale);
+  if (fromSac != null) {
+    return fromSac.clamp(0, 6);
+  }
+  final fromTrack = _bucketFromTracktype(trail.tracktype);
+  if (fromTrack != null) {
+    return fromTrack.clamp(0, 6);
+  }
+  final fromSurface = _bucketFromSurfaceHint(trail.surface);
+  if (fromSurface != null) {
+    return fromSurface.clamp(0, 6);
   }
   return -1;
 }
@@ -1399,6 +1503,29 @@ String _trailDifficultyLabel(int tier) {
     default:
       return 'Unrated';
   }
+}
+
+/// True when difficulty comes from `mtb:scale` / `mtb:scale:imba` or a cycleway default.
+bool _trailDifficultyFromVerifiedOsmTags(TrailData trail) {
+  if (trail.highwayType.toLowerCase() == 'cycleway') {
+    return true;
+  }
+  if (_parseSacScaleDigit(trail.mtbScale) != null) {
+    return true;
+  }
+  if (_parseImbaDigit(trail.mtbScaleImba) != null) {
+    return true;
+  }
+  return false;
+}
+
+String _trailDifficultyDisplayLabel(TrailData trail) {
+  final tier = _trailDifficultyTier(trail);
+  final base = _trailDifficultyLabel(tier);
+  if (tier < 0 || _trailDifficultyFromVerifiedOsmTags(trail)) {
+    return base;
+  }
+  return '$base (est.)';
 }
 
 Widget _trailDifficultyLegendSwatch(int tier) {
@@ -1497,6 +1624,8 @@ class TrailData {
     this.surface,
     this.mtbScale,
     this.mtbScaleImba,
+    this.osmSacScale,
+    this.tracktype,
   });
 
   final int osmId;
@@ -1506,5 +1635,8 @@ class TrailData {
   final String? surface;
   final String? mtbScale;
   final String? mtbScaleImba;
+  /// Hiking `sac_scale` when `mtb:scale` is absent (OpenStreetMap).
+  final String? osmSacScale;
+  final String? tracktype;
   final double lengthKm;
 }
