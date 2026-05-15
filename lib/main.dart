@@ -1474,7 +1474,7 @@ int _trailDifficultyTier(TrailData trail) {
 Color _trailDifficultyColor(int tier) {
   switch (tier) {
     case -1:
-      return const Color(0xFF90A4AE);
+      return const Color(0xFFC62828);
     case 0:
       return const Color(0xFF2E7D32);
     case 1:
@@ -1483,7 +1483,7 @@ Color _trailDifficultyColor(int tier) {
     case 3:
       return const Color(0xFF000000);
     default:
-      return const Color(0xFF90A4AE);
+      return const Color(0xFFC62828);
   }
 }
 
